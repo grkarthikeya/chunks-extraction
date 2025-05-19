@@ -1,65 +1,79 @@
 from flask import Flask, request, send_file
 import json
-import re
 import faiss
+import numpy as np
 from sentence_transformers import SentenceTransformer
+import google.generativeai as genai
 import zipfile
-import os
 import tempfile
+import os
 
 app = Flask(__name__)
 
-# Load the SentenceTransformer model once when the app starts
-model = SentenceTransformer('all-MiniLM-L6-v2')
 
-def extract_chunks(json_data):
-    """Extract text from OCR JSON and separate into labeled chunks."""
-    text_entries = json_data['extracted_text']
-    
-    # Sort by y1 (top coordinate)
-    text_entries.sort(key=lambda x: x['boundingBox'][1])
-    
-    # Group into lines (threshold: 30 pixels)
-    lines = []
-    current_line = [text_entries[0]]
-    for entry in text_entries[1:]:
-        if entry['boundingBox'][1] - current_line[-1]['boundingBox'][1] < 30:
-            current_line.append(entry)
-        else:
-            current_line.sort(key=lambda x: x['boundingBox'][0])
-            lines.append(current_line)
-            current_line = [entry]
-    if current_line:
-        current_line.sort(key=lambda x: x['boundingBox'][0])
-        lines.append(current_line)
-    
-    # Concatenate text within lines
-    line_texts = [' '.join([entry['text'] for entry in line]) for line in lines]
-    
-    # Group into chunks based on labels
-    label_pattern = r"^\d+\.\s*[A-Z]?\)"
-    chunks = {}
-    current_label = None
-    current_chunk = []
-    
-    for line in line_texts:
-        match = re.match(label_pattern, line)
-        if match:
-            if current_label is not None:
-                chunks[current_label] = ' '.join(current_chunk)
-            current_label = match.group(0)
-            current_chunk = [line[len(current_label):].strip()]
-        else:
-            current_chunk.append(line)
-    
-    if current_label is not None:
-        chunks[current_label] = ' '.join(current_chunk)
-    
-    return chunks
+genai.configure(api_key="AIzaSyCwhuP5ymrMdJCaOMlJDE_30RIyidfMQ2M")
+gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+
+# Load SentenceTransformer model
+st_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+def extract_answers(data):
+    words = data['words']
+    labels = data['labels']
+    answers = []
+    current_label = []
+    current_answer = []
+    in_label = False
+    in_answer = False
+
+    for word, label in zip(words, labels):
+        if label == 'B-ANSNUM':
+            if in_answer and current_answer:
+                answer_text = ' '.join(current_answer)
+                answers.append({'label': ' '.join(current_label), 'answer': answer_text})
+                current_answer = []
+            current_label = [word]
+            in_label = True
+            in_answer = False
+        elif label == 'I-ANSNUM':
+            if in_label:
+                current_label.append(word)
+        elif label == 'B-ANSWER':
+            if in_label:
+                in_label = False
+                in_answer = True
+                current_answer = [word]
+        elif label == 'I-ANSWER':
+            if in_answer:
+                current_answer.append(word)
+        elif label in ['O', 'SECTION', 'B-SUBPOINT']:
+            if in_answer and current_answer:
+                answer_text = ' '.join(current_answer)
+                answers.append({'label': ' '.join(current_label), 'answer': answer_text})
+                current_answer = []
+                in_answer = False
+            current_label = []
+            in_label = False
+
+    if in_answer and current_answer:
+        answer_text = ' '.join(current_answer)
+        answers.append({'label': ' '.join(current_label), 'answer': answer_text})
+
+    return answers
+
+def get_keywords(text):
+    prompt = f"Extract key terms or phrases from the following text and list them separated by commas: {text}"
+    response = gemini_model.generate_content(prompt)
+    return response.text.split(', ')
+
+def get_summary(text):
+    prompt = f"Summarize the following text in one or two sentences: {text}"
+    response = gemini_model.generate_content(prompt)
+    return response.text
 
 @app.route('/process', methods=['POST'])
-def process_json():
-    # Validate file upload
+def process_file():
+    # Check if a file is uploaded
     if 'file' not in request.files:
         return 'No file uploaded', 400
     file = request.files['file']
@@ -67,49 +81,58 @@ def process_json():
         return 'No file selected', 400
     if not file.filename.endswith('.json'):
         return 'File must be a JSON file', 400
-    
-    try:
-        # Use a temporary directory for all file operations
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Save the uploaded JSON file
-            json_path = os.path.join(temp_dir, 'input.json')
-            file.save(json_path)
-            
-            # Load JSON data
-            with open(json_path, 'r') as f:
-                data = json.load(f)
-            
-            # Extract chunks
-            chunks = extract_chunks(data)
-            
-            # Generate embeddings
-            labels = list(chunks.keys())
-            chunk_texts = list(chunks.values())
-            embeddings = model.encode(chunk_texts)
-            
-            # Create FAISS index
-            dimension = embeddings.shape[1]
-            index = faiss.IndexFlatL2(dimension)
-            index.add(embeddings)
-            
-            # Save FAISS index and chunks to files
-            faiss_file = os.path.join(temp_dir, 'faiss_index.bin')
-            chunks_file = os.path.join(temp_dir, 'chunks.json')
-            faiss.write_index(index, faiss_file)
-            with open(chunks_file, 'w') as f:
-                json.dump({'labels': labels, 'chunks': chunk_texts}, f)
-            
-            # Create a zip file containing both outputs
-            zip_path = os.path.join(temp_dir, 'output.zip')
-            with zipfile.ZipFile(zip_path, 'w') as zipf:
-                zipf.write(faiss_file, 'faiss_index.bin')
-                zipf.write(chunks_file, 'chunks.json')
-            
-            # Send the zip file as the response
-            return send_file(zip_path, as_attachment=True, download_name='output.zip')
-    
-    except Exception as e:
-        return f'Error processing file: {str(e)}', 500
+
+    # Use a temporary directory for processing
+    with tempfile.TemporaryDirectory() as temp_dir:
+        json_path = os.path.join(temp_dir, 'input.json')
+        file.save(json_path)
+
+        # Load and validate JSON data
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+        if 'words' not in data or 'labels' not in data:
+            return 'JSON must contain "words" and "labels" fields', 400
+
+        # Process the data
+        answers = extract_answers(data)
+        answer_texts = [answer['answer'] for answer in answers]
+        embeddings = st_model.encode(answer_texts)
+        embeddings = np.array(embeddings, dtype=np.float32)
+
+        # Generate metadata
+        metadata = []
+        for answer in answers:
+            label = answer['label']
+            text = answer['answer']
+            keywords = get_keywords(text)
+            summary = get_summary(text)
+            metadata.append({
+                'label': label,
+                'answer': text,
+                'keywords': keywords,
+                'summary': summary
+            })
+
+        # Create and save FAISS index
+        dimension = embeddings.shape[1]
+        index = faiss.IndexFlatL2(dimension)
+        index.add(embeddings)
+        faiss_path = os.path.join(temp_dir, 'embeddings.faiss')
+        faiss.write_index(index, faiss_path)
+
+        # Save metadata to JSON
+        metadata_path = os.path.join(temp_dir, 'metadata.json')
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+        # Create zip file with outputs
+        zip_path = os.path.join(temp_dir, 'output.zip')
+        with zipfile.ZipFile(zip_path, 'w') as zipf:
+            zipf.write(faiss_path, 'embeddings.faiss')
+            zipf.write(metadata_path, 'metadata.json')
+
+        # Return the zip file
+        return send_file(zip_path, as_attachment=True, download_name='output.zip')
 
 if __name__ == '__main__':
     app.run(debug=True)
